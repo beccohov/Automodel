@@ -372,3 +372,39 @@ class TestBackendConfigCompileAttn:
         # compile_mla was consolidated into the generic compile_attn flag.
         with pytest.raises(TypeError):
             BackendConfig(compile_mla=True)
+
+
+class TestBackendConfigPartialCudaGraphs:
+    def test_defaults_are_disabled(self):
+        config = BackendConfig()
+
+        assert config.partial_cuda_graph_attention is False
+        assert config.partial_cuda_graph_moe_router is False
+        assert config.partial_cuda_graph_moe_preprocess is False
+        assert config.partial_cuda_graph_layer_limit == 0
+
+    def test_enabled_scope_requires_positive_layer_limit(self):
+        with pytest.raises(ValueError, match="layer_limit must be positive"):
+            BackendConfig(partial_cuda_graph_attention=True)
+
+    def test_attention_requires_te_backend(self):
+        with pytest.raises(ValueError, match="requires attn='te'"):
+            BackendConfig(
+                attn="sdpa",
+                partial_cuda_graph_attention=True,
+                partial_cuda_graph_layer_limit=1,
+            )
+
+    def test_preprocess_requires_router_and_hybridep(self):
+        with pytest.raises(ValueError, match="requires partial_cuda_graph_moe_router"):
+            BackendConfig(
+                partial_cuda_graph_moe_preprocess=True,
+                partial_cuda_graph_layer_limit=1,
+            )
+        with pytest.raises(ValueError, match="requires dispatcher='hybridep'"):
+            BackendConfig(
+                dispatcher="deepep",
+                partial_cuda_graph_moe_router=True,
+                partial_cuda_graph_moe_preprocess=True,
+                partial_cuda_graph_layer_limit=1,
+            )

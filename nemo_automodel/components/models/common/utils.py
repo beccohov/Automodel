@@ -23,6 +23,7 @@ from torch import nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 logger = logging.getLogger(__name__)
+
 from nemo_automodel.shared.utils import dtype_from_str
 
 HAVE_TE = importlib.util.find_spec("transformer_engine") is not None
@@ -191,6 +192,17 @@ class BackendConfig:
         compile_attn: torch.compile(fullgraph) the attention module's forward — both the
             DeepSeek-V3 MLA and standard GQA attention (e.g. Qwen3-MoE) honor it. Requires
             attn="sdpa", linear="torch", rms_norm="torch", rope_fusion=False.
+        partial_cuda_graph_attention: Opt-in that captures structurally discovered TE
+            FusedAttention boundaries after one complete eager training iteration. The
+            DPA compute must remain BF16.
+        partial_cuda_graph_moe_router: Opt-in that captures graphable fixed-shape MoE
+            routing cores while leaving variable-shape expert dispatch and compute eager.
+        partial_cuda_graph_moe_preprocess: Opt-in that captures HybridEP's fixed-shape
+            top-k-to-multihot preprocessing. Requires the router graph, matching
+            Megatron-LM's scoped dropless-MoE CUDA graph contract.
+        partial_cuda_graph_layer_limit: Positive number of graph-capable layers per enabled
+            partial-graph feature. Limiting the layer count bounds persistent
+            forward/backward graph buffers.
     """
 
     attn: Literal["te", "sdpa", "flex", "eager", "tilelang"] = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
@@ -226,6 +238,10 @@ class BackendConfig:
     # fullgraph can't trace), so it requires attn="sdpa", linear="torch", rms_norm="torch",
     # rope_fusion=False. Default False.
     compile_attn: bool = False
+    partial_cuda_graph_attention: bool = False
+    partial_cuda_graph_moe_router: bool = False
+    partial_cuda_graph_moe_preprocess: bool = False
+    partial_cuda_graph_layer_limit: int = 0
 
     def __post_init__(self):
         # Normalize te_fp8: dict -> TEFp8Config, None stays None
@@ -261,6 +277,25 @@ class BackendConfig:
             self.dispatcher = "torch"
             self.experts = "torch_mm"
 
+        partial_cuda_graph_enabled = (
+            self.partial_cuda_graph_attention
+            or self.partial_cuda_graph_moe_router
+            or self.partial_cuda_graph_moe_preprocess
+        )
+        if partial_cuda_graph_enabled and self.partial_cuda_graph_layer_limit <= 0:
+            raise ValueError("partial_cuda_graph_layer_limit must be positive when partial CUDA graphs are enabled")
+        if self.partial_cuda_graph_attention and self.attn != "te":
+            raise ValueError("partial_cuda_graph_attention requires attn='te'")
+        if self.partial_cuda_graph_attention and self.te_fp8 is not None:
+            recipe_fp8_dpa = getattr(self.te_fp8.recipe, "fp8_dpa", False)
+            if recipe_fp8_dpa:
+                raise ValueError("partial_cuda_graph_attention requires BF16 dot-product attention (fp8_dpa=False)")
+        if self.partial_cuda_graph_moe_preprocess and not self.partial_cuda_graph_moe_router:
+            raise ValueError("partial_cuda_graph_moe_preprocess requires partial_cuda_graph_moe_router=True")
+        if self.partial_cuda_graph_moe_router and self.fake_balanced_gate:
+            raise ValueError("partial_cuda_graph_moe_router requires the learned Gate (fake_balanced_gate=False)")
+        if self.partial_cuda_graph_moe_preprocess and self.dispatcher != "hybridep":
+            raise ValueError("partial_cuda_graph_moe_preprocess requires dispatcher='hybridep'")
         # FP8 requires at least one TE backend (applies to all TE modules: Linear, GroupedLinear, RMSNorm)
         if self.te_fp8 is not None and self.linear != "te" and self.experts != "te":
             raise ValueError(
